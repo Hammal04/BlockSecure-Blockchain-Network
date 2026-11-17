@@ -1,194 +1,279 @@
 package chaincode
 
 import (
+	"crypto"
+	"crypto/ecdsa"
+	"crypto/ed25519"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
+	"regexp"
+	"strings"
+	"time"
 
 	"github.com/hyperledger/fabric-contract-api-go/v2/contractapi"
 )
 
-// SmartContract provides functions for managing an Asset
+const messageKeyPrefix = "message:"
+
+var messageIDPattern = regexp.MustCompile(`^[A-Za-z0-9._-]{1,128}$`)
+
+// SmartContract stores verifiable message metadata on the BlockSecure ledger.
+// Plaintext messages and private signing keys must remain off-chain.
 type SmartContract struct {
 	contractapi.Contract
 }
 
-// Asset describes basic details of what makes up a simple asset
-// Insert struct field in alphabetic order => to achieve determinism across languages
-// golang keeps the order when marshal to json but doesn't order automatically
-type Asset struct {
-	AppraisedValue int    `json:"AppraisedValue"`
-	Color          string `json:"Color"`
-	ID             string `json:"ID"`
-	Owner          string `json:"Owner"`
-	Size           int    `json:"Size"`
+// MessageRecord is the immutable on-chain record for a signed message digest.
+type MessageRecord struct {
+	MessageID          string `json:"messageId"`
+	Sender             string `json:"sender"`
+	Receiver           string `json:"receiver"`
+	MessageHash        string `json:"messageHash"`
+	Signature          string `json:"signature"`
+	SignatureAlgorithm string `json:"signatureAlgorithm"`
+	PublicKeyPEM       string `json:"publicKeyPem"`
+	CreatedAt          string `json:"createdAt"`
+	TransactionID      string `json:"transactionId"`
 }
 
-// InitLedger adds a base set of assets to the ledger
-func (s *SmartContract) InitLedger(ctx contractapi.TransactionContextInterface) error {
-	assets := []Asset{
-		{ID: "asset1", Color: "blue", Size: 5, Owner: "Tomoko", AppraisedValue: 300},
-		{ID: "asset2", Color: "red", Size: 5, Owner: "Brad", AppraisedValue: 400},
-		{ID: "asset3", Color: "green", Size: 10, Owner: "Jin Soo", AppraisedValue: 500},
-		{ID: "asset4", Color: "yellow", Size: 10, Owner: "Max", AppraisedValue: 600},
-		{ID: "asset5", Color: "black", Size: 15, Owner: "Adriana", AppraisedValue: 700},
-		{ID: "asset6", Color: "white", Size: 15, Owner: "Michel", AppraisedValue: 800},
+// RecordMessage records a SHA-256 message digest and verifies the sender's
+// digital signature before writing the record. The signature is Base64-encoded
+// and signs the 32 raw bytes represented by messageHash (not the hex text).
+//
+// Supported SignatureAlgorithm values:
+//   - ECDSA-SHA256 (ASN.1 DER signature)
+//   - RSA-PSS-SHA256
+//   - RSA-PKCS1v15-SHA256
+//   - ED25519 (signature over the 32-byte digest)
+//
+// The message plaintext and the sender's private key are never stored on-chain.
+func (s *SmartContract) RecordMessage(
+	ctx contractapi.TransactionContextInterface,
+	messageID string,
+	sender string,
+	receiver string,
+	messageHash string,
+	signature string,
+	signatureAlgorithm string,
+	publicKeyPEM string,
+) error {
+	messageID = strings.TrimSpace(messageID)
+	sender = strings.TrimSpace(sender)
+	receiver = strings.TrimSpace(receiver)
+	signature = strings.TrimSpace(signature)
+	signatureAlgorithm = strings.ToUpper(strings.TrimSpace(signatureAlgorithm))
+
+	if !messageIDPattern.MatchString(messageID) {
+		return fmt.Errorf("message ID must contain 1-128 letters, numbers, dots, underscores, or hyphens")
+	}
+	if sender == "" || receiver == "" {
+		return fmt.Errorf("sender and receiver are required")
 	}
 
-	for _, asset := range assets {
-		assetJSON, err := json.Marshal(asset)
-		if err != nil {
-			return err
-		}
-
-		err = ctx.GetStub().PutState(asset.ID, assetJSON)
-		if err != nil {
-			return fmt.Errorf("failed to put to world state. %w", err)
-		}
+	digest, normalizedHash, err := parseSHA256Hash(messageHash)
+	if err != nil {
+		return err
+	}
+	signatureBytes, err := base64.StdEncoding.DecodeString(signature)
+	if err != nil || len(signatureBytes) == 0 {
+		return fmt.Errorf("signature must be non-empty Base64 data")
+	}
+	if err := verifyDigestSignature(digest, signatureBytes, signatureAlgorithm, publicKeyPEM); err != nil {
+		return err
 	}
 
+	key := messageKeyPrefix + messageID
+	existing, err := ctx.GetStub().GetState(key)
+	if err != nil {
+		return fmt.Errorf("failed to check message existence: %w", err)
+	}
+	if existing != nil {
+		return fmt.Errorf("message %s already exists", messageID)
+	}
+
+	txTimestamp, err := ctx.GetStub().GetTxTimestamp()
+	if err != nil {
+		return fmt.Errorf("failed to get transaction timestamp: %w", err)
+	}
+	if txTimestamp == nil {
+		return fmt.Errorf("transaction timestamp is unavailable")
+	}
+
+	record := MessageRecord{
+		MessageID:          messageID,
+		Sender:             sender,
+		Receiver:           receiver,
+		MessageHash:        normalizedHash,
+		Signature:          signature,
+		SignatureAlgorithm: signatureAlgorithm,
+		PublicKeyPEM:       strings.TrimSpace(publicKeyPEM),
+		CreatedAt:          time.Unix(txTimestamp.Seconds, int64(txTimestamp.Nanos)).UTC().Format(time.RFC3339Nano),
+		TransactionID:      ctx.GetStub().GetTxID(),
+	}
+	recordJSON, err := json.Marshal(record)
+	if err != nil {
+		return fmt.Errorf("failed to encode message record: %w", err)
+	}
+	if err := ctx.GetStub().PutState(key, recordJSON); err != nil {
+		return fmt.Errorf("failed to store message record: %w", err)
+	}
 	return nil
 }
 
-// CreateAsset issues a new asset to the world state with given details.
-func (s *SmartContract) CreateAsset(ctx contractapi.TransactionContextInterface, id string, color string, size int, owner string, appraisedValue int) error {
-	exists, err := s.AssetExists(ctx, id)
+// ReadMessage returns the on-chain record for a message ID.
+func (s *SmartContract) ReadMessage(ctx contractapi.TransactionContextInterface, messageID string) (*MessageRecord, error) {
+	if !messageIDPattern.MatchString(strings.TrimSpace(messageID)) {
+		return nil, fmt.Errorf("invalid message ID")
+	}
+	recordJSON, err := ctx.GetStub().GetState(messageKeyPrefix + strings.TrimSpace(messageID))
 	if err != nil {
-		return err
+		return nil, fmt.Errorf("failed to read message record: %w", err)
 	}
-	if exists {
-		return fmt.Errorf("the asset %s already exists", id)
+	if recordJSON == nil {
+		return nil, fmt.Errorf("message %s does not exist", messageID)
 	}
-
-	asset := Asset{
-		ID:             id,
-		Color:          color,
-		Size:           size,
-		Owner:          owner,
-		AppraisedValue: appraisedValue,
+	var record MessageRecord
+	if err := json.Unmarshal(recordJSON, &record); err != nil {
+		return nil, fmt.Errorf("failed to decode message record: %w", err)
 	}
-	assetJSON, err := json.Marshal(asset)
-	if err != nil {
-		return err
-	}
-
-	return ctx.GetStub().PutState(id, assetJSON)
+	return &record, nil
 }
 
-// ReadAsset returns the asset stored in the world state with given id.
-func (s *SmartContract) ReadAsset(ctx contractapi.TransactionContextInterface, id string) (*Asset, error) {
-	assetJSON, err := ctx.GetStub().GetState(id)
+// MessageExists reports whether a message ID has already been recorded.
+func (s *SmartContract) MessageExists(ctx contractapi.TransactionContextInterface, messageID string) (bool, error) {
+	if !messageIDPattern.MatchString(strings.TrimSpace(messageID)) {
+		return false, fmt.Errorf("invalid message ID")
+	}
+	value, err := ctx.GetStub().GetState(messageKeyPrefix + strings.TrimSpace(messageID))
 	if err != nil {
-		return nil, fmt.Errorf("failed to read from world state: %w", err)
+		return false, fmt.Errorf("failed to check message existence: %w", err)
 	}
-	if assetJSON == nil {
-		return nil, fmt.Errorf("the asset %s does not exist", id)
-	}
-
-	var asset Asset
-	err = json.Unmarshal(assetJSON, &asset)
-	if err != nil {
-		return nil, err
-	}
-
-	return &asset, nil
+	return value != nil, nil
 }
 
-// UpdateAsset updates an existing asset in the world state with provided parameters.
-func (s *SmartContract) UpdateAsset(ctx contractapi.TransactionContextInterface, id string, color string, size int, owner string, appraisedValue int) error {
-	exists, err := s.AssetExists(ctx, id)
+// VerifyMessageHash compares a supplied SHA-256 digest with the digest
+// recorded on-chain. This checks ledger consistency; it does not retrieve
+// plaintext message contents.
+func (s *SmartContract) VerifyMessageHash(ctx contractapi.TransactionContextInterface, messageID string, submittedHash string) (bool, error) {
+	_, normalizedHash, err := parseSHA256Hash(submittedHash)
 	if err != nil {
-		return err
+		return false, err
 	}
-	if !exists {
-		return fmt.Errorf("the asset %s does not exist", id)
-	}
-
-	// overwriting original asset with new asset
-	asset := Asset{
-		ID:             id,
-		Color:          color,
-		Size:           size,
-		Owner:          owner,
-		AppraisedValue: appraisedValue,
-	}
-	assetJSON, err := json.Marshal(asset)
+	record, err := s.ReadMessage(ctx, messageID)
 	if err != nil {
-		return err
+		return false, err
 	}
-
-	return ctx.GetStub().PutState(id, assetJSON)
+	return record.MessageHash == normalizedHash, nil
 }
 
-// DeleteAsset deletes an given asset from the world state.
-func (s *SmartContract) DeleteAsset(ctx contractapi.TransactionContextInterface, id string) error {
-	exists, err := s.AssetExists(ctx, id)
-	if err != nil {
-		return err
-	}
-	if !exists {
-		return fmt.Errorf("the asset %s does not exist", id)
-	}
-
-	return ctx.GetStub().DelState(id)
+// GetAllMessages returns every message record stored under the message: prefix.
+func (s *SmartContract) GetAllMessages(ctx contractapi.TransactionContextInterface) ([]*MessageRecord, error) {
+	return s.getMessages(ctx, "", "")
 }
 
-// AssetExists returns true when asset with given ID exists in world state
-func (s *SmartContract) AssetExists(ctx contractapi.TransactionContextInterface, id string) (bool, error) {
-	assetJSON, err := ctx.GetStub().GetState(id)
-	if err != nil {
-		return false, fmt.Errorf("failed to read from world state: %w", err)
+// GetMessagesBySender returns message records for a sender identity.
+func (s *SmartContract) GetMessagesBySender(ctx contractapi.TransactionContextInterface, sender string) ([]*MessageRecord, error) {
+	sender = strings.TrimSpace(sender)
+	if sender == "" {
+		return nil, fmt.Errorf("sender is required")
 	}
-
-	return assetJSON != nil, nil
+	return s.getMessages(ctx, "sender", sender)
 }
 
-// TransferAsset updates the owner field of asset with given id in world state, and returns the old owner.
-func (s *SmartContract) TransferAsset(ctx contractapi.TransactionContextInterface, id string, newOwner string) (string, error) {
-	asset, err := s.ReadAsset(ctx, id)
-	if err != nil {
-		return "", err
+// GetMessagesByReceiver returns message records for a receiver identity.
+func (s *SmartContract) GetMessagesByReceiver(ctx contractapi.TransactionContextInterface, receiver string) ([]*MessageRecord, error) {
+	receiver = strings.TrimSpace(receiver)
+	if receiver == "" {
+		return nil, fmt.Errorf("receiver is required")
 	}
-
-	oldOwner := asset.Owner
-	asset.Owner = newOwner
-
-	assetJSON, err := json.Marshal(asset)
-	if err != nil {
-		return "", err
-	}
-
-	err = ctx.GetStub().PutState(id, assetJSON)
-	if err != nil {
-		return "", err
-	}
-
-	return oldOwner, nil
+	return s.getMessages(ctx, "receiver", receiver)
 }
 
-// GetAllAssets returns all assets found in world state
-func (s *SmartContract) GetAllAssets(ctx contractapi.TransactionContextInterface) ([]*Asset, error) {
-	// range query with empty string for startKey and endKey does an
-	// open-ended query of all assets in the chaincode namespace.
-	resultsIterator, err := ctx.GetStub().GetStateByRange("", "")
+func (s *SmartContract) getMessages(ctx contractapi.TransactionContextInterface, field string, value string) ([]*MessageRecord, error) {
+	iterator, err := ctx.GetStub().GetStateByRange("", "")
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to query ledger: %w", err)
 	}
-	defer resultsIterator.Close()
+	defer iterator.Close()
 
-	var assets []*Asset
-	for resultsIterator.HasNext() {
-		queryResponse, err := resultsIterator.Next()
+	var records []*MessageRecord
+	for iterator.HasNext() {
+		entry, err := iterator.Next()
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("failed to read ledger entry: %w", err)
 		}
+		if !strings.HasPrefix(entry.GetKey(), messageKeyPrefix) {
+			continue
+		}
+		var record MessageRecord
+		if err := json.Unmarshal(entry.GetValue(), &record); err != nil {
+			return nil, fmt.Errorf("failed to decode message record: %w", err)
+		}
+		switch field {
+		case "sender":
+			if record.Sender != value {
+				continue
+			}
+		case "receiver":
+			if record.Receiver != value {
+				continue
+			}
+		}
+		records = append(records, &record)
+	}
+	return records, nil
+}
 
-		var asset Asset
-		err = json.Unmarshal(queryResponse.GetValue(), &asset)
-		if err != nil {
-			return nil, err
-		}
-		assets = append(assets, &asset)
+func parseSHA256Hash(value string) ([]byte, string, error) {
+	normalized := strings.ToLower(strings.TrimSpace(value))
+	if len(normalized) != 64 {
+		return nil, "", fmt.Errorf("message hash must be a 64-character SHA-256 hex digest")
+	}
+	digest, err := hex.DecodeString(normalized)
+	if err != nil {
+		return nil, "", fmt.Errorf("message hash must be hexadecimal")
+	}
+	return digest, normalized, nil
+}
+
+func verifyDigestSignature(digest []byte, signature []byte, algorithm string, publicKeyPEM string) error {
+	block, _ := pem.Decode([]byte(strings.TrimSpace(publicKeyPEM)))
+	if block == nil {
+		return fmt.Errorf("public key must be PEM encoded")
+	}
+	publicKey, err := x509.ParsePKIXPublicKey(block.Bytes)
+	if err != nil {
+		return fmt.Errorf("invalid public key: %w", err)
 	}
 
-	return assets, nil
+	switch algorithm {
+	case "ECDSA-SHA256":
+		key, ok := publicKey.(*ecdsa.PublicKey)
+		if !ok || !ecdsa.VerifyASN1(key, digest, signature) {
+			return fmt.Errorf("ECDSA signature verification failed")
+		}
+	case "RSA-PSS-SHA256":
+		key, ok := publicKey.(*rsa.PublicKey)
+		if !ok || rsa.VerifyPSS(key, crypto.SHA256, digest, signature, nil) != nil {
+			return fmt.Errorf("RSA-PSS signature verification failed")
+		}
+	case "RSA-PKCS1V15-SHA256":
+		key, ok := publicKey.(*rsa.PublicKey)
+		if !ok || rsa.VerifyPKCS1v15(key, crypto.SHA256, digest, signature) != nil {
+			return fmt.Errorf("RSA-PKCS1v15 signature verification failed")
+		}
+	case "ED25519":
+		key, ok := publicKey.(ed25519.PublicKey)
+		if !ok || !ed25519.Verify(key, digest, signature) {
+			return fmt.Errorf("Ed25519 signature verification failed")
+		}
+	default:
+		return fmt.Errorf("unsupported signature algorithm %q", algorithm)
+	}
+	return nil
 }
