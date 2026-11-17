@@ -5,6 +5,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
@@ -22,68 +23,78 @@ const messageKeyPrefix = "message:"
 
 var messageIDPattern = regexp.MustCompile(`^[A-Za-z0-9._-]{1,128}$`)
 
-// SmartContract stores verifiable message metadata on the BlockSecure ledger.
-// Plaintext messages and private signing keys must remain off-chain.
+// SmartContract exposes BlockSecure message-integrity transactions.
+// Message plaintext and private keys must remain off-chain.
 type SmartContract struct {
 	contractapi.Contract
 }
 
-// MessageRecord is the immutable on-chain record for a signed message digest.
+// MessageRecord stores verifiable metadata and a signed SHA-256 digest.
 type MessageRecord struct {
 	MessageID          string `json:"messageId"`
 	Sender             string `json:"sender"`
+	SenderMSPID        string `json:"senderMspId"`
+	SenderCertSHA256   string `json:"senderCertSha256"`
 	Receiver           string `json:"receiver"`
 	MessageHash        string `json:"messageHash"`
 	Signature          string `json:"signature"`
 	SignatureAlgorithm string `json:"signatureAlgorithm"`
-	PublicKeyPEM       string `json:"publicKeyPem"`
 	CreatedAt          string `json:"createdAt"`
 	TransactionID      string `json:"transactionId"`
 }
 
-// RecordMessage records a SHA-256 message digest and verifies the sender's
-// digital signature before writing the record. The signature is Base64-encoded
-// and signs the 32 raw bytes represented by messageHash (not the hex text).
+// RecordMessage validates the caller's digital signature using the X.509
+// certificate associated with the submitting Fabric identity, then records
+// only the message digest and metadata. The sender cannot be spoofed through
+// an argument: it is derived from the authenticated Fabric client identity.
 //
-// Supported SignatureAlgorithm values:
-//   - ECDSA-SHA256 (ASN.1 DER signature)
-//   - RSA-PSS-SHA256
-//   - RSA-PKCS1v15-SHA256
-//   - ED25519 (signature over the 32-byte digest)
-//
-// The message plaintext and the sender's private key are never stored on-chain.
+// Args: messageID, receiver, messageHash, signatureBase64, signatureAlgorithm.
+// The application signature must cover SHA-256(message plaintext). ECDSA and
+// RSA algorithms use the SHA-256 digest; Ed25519 signs the raw digest bytes.
 func (s *SmartContract) RecordMessage(
 	ctx contractapi.TransactionContextInterface,
 	messageID string,
-	sender string,
 	receiver string,
 	messageHash string,
-	signature string,
+	signatureBase64 string,
 	signatureAlgorithm string,
-	publicKeyPEM string,
 ) error {
 	messageID = strings.TrimSpace(messageID)
-	sender = strings.TrimSpace(sender)
 	receiver = strings.TrimSpace(receiver)
-	signature = strings.TrimSpace(signature)
 	signatureAlgorithm = strings.ToUpper(strings.TrimSpace(signatureAlgorithm))
 
 	if !messageIDPattern.MatchString(messageID) {
 		return fmt.Errorf("message ID must contain 1-128 letters, numbers, dots, underscores, or hyphens")
 	}
-	if sender == "" || receiver == "" {
-		return fmt.Errorf("sender and receiver are required")
+	if receiver == "" {
+		return fmt.Errorf("receiver is required")
 	}
-
 	digest, normalizedHash, err := parseSHA256Hash(messageHash)
 	if err != nil {
 		return err
 	}
-	signatureBytes, err := base64.StdEncoding.DecodeString(signature)
-	if err != nil || len(signatureBytes) == 0 {
+	signature, err := base64.StdEncoding.DecodeString(strings.TrimSpace(signatureBase64))
+	if err != nil || len(signature) == 0 {
 		return fmt.Errorf("signature must be non-empty Base64 data")
 	}
-	if err := verifyDigestSignature(digest, signatureBytes, signatureAlgorithm, publicKeyPEM); err != nil {
+
+	clientIdentity := ctx.GetClientIdentity()
+	if clientIdentity == nil {
+		return fmt.Errorf("submitting Fabric client identity is unavailable")
+	}
+	senderID, err := clientIdentity.GetID()
+	if err != nil || strings.TrimSpace(senderID) == "" {
+		return fmt.Errorf("unable to identify submitting Fabric client")
+	}
+	mspID, err := clientIdentity.GetMSPID()
+	if err != nil || strings.TrimSpace(mspID) == "" {
+		return fmt.Errorf("unable to identify submitting organization")
+	}
+	certificate, err := clientIdentity.GetX509Certificate()
+	if err != nil || certificate == nil {
+		return fmt.Errorf("submitting identity must use an X.509 certificate")
+	}
+	if err := verifyPublicKeySignature(certificate.PublicKey, digest, signature, signatureAlgorithm); err != nil {
 		return err
 	}
 
@@ -104,14 +115,16 @@ func (s *SmartContract) RecordMessage(
 		return fmt.Errorf("transaction timestamp is unavailable")
 	}
 
+	certificateDigest := sha256.Sum256(certificate.Raw)
 	record := MessageRecord{
 		MessageID:          messageID,
-		Sender:             sender,
+		Sender:             senderID,
+		SenderMSPID:        mspID,
+		SenderCertSHA256:   hex.EncodeToString(certificateDigest[:]),
 		Receiver:           receiver,
 		MessageHash:        normalizedHash,
-		Signature:          signature,
+		Signature:          strings.TrimSpace(signatureBase64),
 		SignatureAlgorithm: signatureAlgorithm,
-		PublicKeyPEM:       strings.TrimSpace(publicKeyPEM),
 		CreatedAt:          time.Unix(txTimestamp.Seconds, int64(txTimestamp.Nanos)).UTC().Format(time.RFC3339Nano),
 		TransactionID:      ctx.GetStub().GetTxID(),
 	}
@@ -125,12 +138,13 @@ func (s *SmartContract) RecordMessage(
 	return nil
 }
 
-// ReadMessage returns the on-chain record for a message ID.
+// ReadMessage returns the signed message metadata for a message ID.
 func (s *SmartContract) ReadMessage(ctx contractapi.TransactionContextInterface, messageID string) (*MessageRecord, error) {
-	if !messageIDPattern.MatchString(strings.TrimSpace(messageID)) {
+	messageID = strings.TrimSpace(messageID)
+	if !messageIDPattern.MatchString(messageID) {
 		return nil, fmt.Errorf("invalid message ID")
 	}
-	recordJSON, err := ctx.GetStub().GetState(messageKeyPrefix + strings.TrimSpace(messageID))
+	recordJSON, err := ctx.GetStub().GetState(messageKeyPrefix + messageID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read message record: %w", err)
 	}
@@ -146,19 +160,19 @@ func (s *SmartContract) ReadMessage(ctx contractapi.TransactionContextInterface,
 
 // MessageExists reports whether a message ID has already been recorded.
 func (s *SmartContract) MessageExists(ctx contractapi.TransactionContextInterface, messageID string) (bool, error) {
-	if !messageIDPattern.MatchString(strings.TrimSpace(messageID)) {
+	messageID = strings.TrimSpace(messageID)
+	if !messageIDPattern.MatchString(messageID) {
 		return false, fmt.Errorf("invalid message ID")
 	}
-	value, err := ctx.GetStub().GetState(messageKeyPrefix + strings.TrimSpace(messageID))
+	value, err := ctx.GetStub().GetState(messageKeyPrefix + messageID)
 	if err != nil {
 		return false, fmt.Errorf("failed to check message existence: %w", err)
 	}
 	return value != nil, nil
 }
 
-// VerifyMessageHash compares a supplied SHA-256 digest with the digest
-// recorded on-chain. This checks ledger consistency; it does not retrieve
-// plaintext message contents.
+// VerifyMessageHash compares a supplied SHA-256 digest with the stored digest.
+// This confirms ledger consistency; it cannot inspect off-chain plaintext.
 func (s *SmartContract) VerifyMessageHash(ctx contractapi.TransactionContextInterface, messageID string, submittedHash string) (bool, error) {
 	_, normalizedHash, err := parseSHA256Hash(submittedHash)
 	if err != nil {
@@ -171,12 +185,12 @@ func (s *SmartContract) VerifyMessageHash(ctx contractapi.TransactionContextInte
 	return record.MessageHash == normalizedHash, nil
 }
 
-// GetAllMessages returns every message record stored under the message: prefix.
+// GetAllMessages returns all message records in the ledger namespace.
 func (s *SmartContract) GetAllMessages(ctx contractapi.TransactionContextInterface) ([]*MessageRecord, error) {
 	return s.getMessages(ctx, "", "")
 }
 
-// GetMessagesBySender returns message records for a sender identity.
+// GetMessagesBySender returns message records for an authenticated sender ID.
 func (s *SmartContract) GetMessagesBySender(ctx contractapi.TransactionContextInterface, sender string) ([]*MessageRecord, error) {
 	sender = strings.TrimSpace(sender)
 	if sender == "" {
@@ -185,7 +199,7 @@ func (s *SmartContract) GetMessagesBySender(ctx contractapi.TransactionContextIn
 	return s.getMessages(ctx, "sender", sender)
 }
 
-// GetMessagesByReceiver returns message records for a receiver identity.
+// GetMessagesByReceiver returns message records for a receiver identifier.
 func (s *SmartContract) GetMessagesByReceiver(ctx contractapi.TransactionContextInterface, receiver string) ([]*MessageRecord, error) {
 	receiver = strings.TrimSpace(receiver)
 	if receiver == "" {
@@ -231,7 +245,7 @@ func (s *SmartContract) getMessages(ctx contractapi.TransactionContextInterface,
 
 func parseSHA256Hash(value string) ([]byte, string, error) {
 	normalized := strings.ToLower(strings.TrimSpace(value))
-	if len(normalized) != 64 {
+	if len(normalized) != sha256.Size*2 {
 		return nil, "", fmt.Errorf("message hash must be a 64-character SHA-256 hex digest")
 	}
 	digest, err := hex.DecodeString(normalized)
@@ -241,16 +255,7 @@ func parseSHA256Hash(value string) ([]byte, string, error) {
 	return digest, normalized, nil
 }
 
-func verifyDigestSignature(digest []byte, signature []byte, algorithm string, publicKeyPEM string) error {
-	block, _ := pem.Decode([]byte(strings.TrimSpace(publicKeyPEM)))
-	if block == nil {
-		return fmt.Errorf("public key must be PEM encoded")
-	}
-	publicKey, err := x509.ParsePKIXPublicKey(block.Bytes)
-	if err != nil {
-		return fmt.Errorf("invalid public key: %w", err)
-	}
-
+func verifyPublicKeySignature(publicKey any, digest []byte, signature []byte, algorithm string) error {
 	switch algorithm {
 	case "ECDSA-SHA256":
 		key, ok := publicKey.(*ecdsa.PublicKey)
@@ -276,4 +281,13 @@ func verifyDigestSignature(digest []byte, signature []byte, algorithm string, pu
 		return fmt.Errorf("unsupported signature algorithm %q", algorithm)
 	}
 	return nil
+}
+
+// publicKeyPEM is used by tests and diagnostics when a PEM-encoded public key is needed.
+func publicKeyPEM(publicKey any) (string, error) {
+	encoded, err := x509.MarshalPKIXPublicKey(publicKey)
+	if err != nil {
+		return "", err
+	}
+	return string(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: encoded})), nil
 }
