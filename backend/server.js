@@ -58,7 +58,7 @@ app.post("/api/signing-key/challenge", async (request, response) => {
       request.body.publicKeyPem,
       request.body.signatureAlgorithm.trim().toUpperCase(),
     );
-    return response.json({ challenge: Buffer.from(challenge).toString("utf8") });
+    return response.json({ challenge: decodeResult(challenge) });
   } catch (error) {
     console.error("Signing-key challenge failed:", String(error?.message || ""));
     return response.status(502).json({ error: "Unable to create a signing-key challenge." });
