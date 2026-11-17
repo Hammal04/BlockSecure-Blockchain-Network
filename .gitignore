@@ -1,0 +1,32 @@
+# Environment files and secrets
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+*.keystore
+
+# Fabric identities and generated network material
+organizations/
+wallet/
+wallets/
+msp/
+channel-artifacts/
+system-genesis-block/
+
+# Local backups
+backups/
+*_backup.go
+
+# Go build/test artifacts
+*.exe
+*.test
+*.out
+
+# Editors and operating systems
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
