@@ -30,7 +30,7 @@ export function isValidBase64(value) {
 export function isValidPublicKeyPEM(value) {
   return typeof value === "string"
     && value.length <= 16384
-    && /-----BEGIN PUBLIC KEY-----[\\s\\S]+-----END PUBLIC KEY-----/.test(value.trim());
+    && /-----BEGIN PUBLIC KEY-----[\s\S]+-----END PUBLIC KEY-----/.test(value.trim());
 }
 
 export function validateSigningKeyRegistration(body) {
