@@ -20,6 +20,9 @@ system-genesis-block/
 backups/
 *_backup.go
 
+# Vendored dependencies (recreated by Fabric chaincode deployment)
+vendor/
+
 # Go build/test artifacts
 *.exe
 *.test
