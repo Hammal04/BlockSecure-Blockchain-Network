@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
-import grpc from "@grpc/grpc-js";
+import * as grpc from "@grpc/grpc-js";
 import { connect, hash, signers } from "@hyperledger/fabric-gateway";
 
 function requiredEnv(name) {
