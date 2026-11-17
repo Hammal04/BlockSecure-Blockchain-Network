@@ -1,6 +1,15 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { isValidMessageId, isValidSha256, isValidBase64, validateRecordMessage } from "./validation.js";
+import {
+  isValidMessageId,
+  isValidSha256,
+  isValidBase64,
+  validateRecordMessage,
+  validateSigningKeyChallenge,
+  validateSigningKeyRegistration,
+} from "./validation.js";
+
+const publicKeyPem = "-----BEGIN PUBLIC KEY-----\nYWJj\n-----END PUBLIC KEY-----";
 
 test("validates message identifiers", () => {
   assert.equal(isValidMessageId("message_01-v2"), true);
@@ -25,18 +34,36 @@ test("accepts a valid RecordMessage request", () => {
     receiver: "receiver-01",
     messageHash: "a".repeat(64),
     signature: Buffer.from("signature").toString("base64"),
-    signatureAlgorithm: "ECDSA-SHA256",
   });
   assert.deepEqual(errors, []);
 });
 
-test("rejects invalid and unsupported RecordMessage input", () => {
+test("rejects invalid RecordMessage input", () => {
   const errors = validateRecordMessage({
     messageId: "../bad",
     receiver: "",
     messageHash: "invalid",
     signature: "???",
-    signatureAlgorithm: "MD5",
   });
-  assert.equal(errors.length, 5);
+  assert.equal(errors.length, 4);
+});
+
+test("validates signing-key challenge requests", () => {
+  assert.deepEqual(validateSigningKeyChallenge({
+    publicKeyPem,
+    signatureAlgorithm: "ECDSA-SHA256",
+  }), []);
+});
+
+test("validates signing-key proof-of-possession requests", () => {
+  assert.deepEqual(validateSigningKeyRegistration({
+    publicKeyPem,
+    signatureAlgorithm: "ECDSA-SHA256",
+    proofSignature: Buffer.from("proof").toString("base64"),
+  }), []);
+  assert.equal(validateSigningKeyRegistration({
+    publicKeyPem,
+    signatureAlgorithm: "MD5",
+    proofSignature: "invalid",
+  }).length, 2);
 });
