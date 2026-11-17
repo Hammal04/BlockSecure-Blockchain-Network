@@ -55,20 +55,23 @@ These results document local test-network validation; they do not yet demonstrat
 ## Repository structure
 
 ```text
-BlockSecure-Project/
+BlockSecure-Blockchain-Network/
+├── .gitignore
 ├── README.md
 └── blocksecure-chaincode/
     ├── assetTransfer.go
     ├── go.mod
     ├── go.sum
-    ├── chaincode/
-    │   ├── smartcontract.go
-    │   ├── smartcontract_test.go
-    │   └── mocks/
-    └── backups/
+    └── chaincode/
+        ├── smartcontract.go
+        ├── smartcontract_test.go
+        └── mocks/
+            ├── chaincodestub.go
+            ├── statequeryiterator.go
+            └── transaction.go
 ```
 
-The `backups/` directory is retained locally for development recovery and is excluded from Git by `.gitignore`.
+Local recovery backups and vendored dependencies are excluded from the repository.
 
 ## Planned work
 
