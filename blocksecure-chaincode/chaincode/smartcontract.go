@@ -6,11 +6,9 @@ import (
 	"crypto/ed25519"
 	"crypto/rsa"
 	"crypto/sha256"
-	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
-	"encoding/pem"
 	"fmt"
 	"regexp"
 	"strings"
@@ -209,7 +207,7 @@ func (s *SmartContract) GetMessagesByReceiver(ctx contractapi.TransactionContext
 }
 
 func (s *SmartContract) getMessages(ctx contractapi.TransactionContextInterface, field string, value string) ([]*MessageRecord, error) {
-	iterator, err := ctx.GetStub().GetStateByRange("", "")
+	iterator, err := ctx.GetStub().GetStateByRange("message:", "message;")
 	if err != nil {
 		return nil, fmt.Errorf("failed to query ledger: %w", err)
 	}
@@ -281,13 +279,4 @@ func verifyPublicKeySignature(publicKey any, digest []byte, signature []byte, al
 		return fmt.Errorf("unsupported signature algorithm %q", algorithm)
 	}
 	return nil
-}
-
-// publicKeyPEM is used by tests and diagnostics when a PEM-encoded public key is needed.
-func publicKeyPEM(publicKey any) (string, error) {
-	encoded, err := x509.MarshalPKIXPublicKey(publicKey)
-	if err != nil {
-		return "", err
-	}
-	return string(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: encoded})), nil
 }
