@@ -285,8 +285,9 @@ func TestReadMessageVerifyHashAndMessageIDValidation(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, valid)
 
-	valid, err = contract.VerifyMessageHash(ctx, "msg-004", hex.EncodeToString(sha256.New().Sum([]byte("different"))))
-	require.Error(t, err)
+	wrongDigest := sha256.Sum256([]byte("different"))
+	valid, err = contract.VerifyMessageHash(ctx, "msg-004", hex.EncodeToString(wrongDigest[:]))
+	require.NoError(t, err)
 	require.False(t, valid)
 
 	require.False(t, messageIDPattern.MatchString("../bad/key"))
