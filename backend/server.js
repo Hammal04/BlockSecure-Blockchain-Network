@@ -3,7 +3,11 @@ import express from "express";
 import cors from "cors";
 import helmet from "helmet";
 import { connectFabric } from "./src/fabric.js";
-import { validateRecordMessage } from "./src/validation.js";
+import {
+  validateRecordMessage,
+  validateSigningKeyChallenge,
+  validateSigningKeyRegistration,
+} from "./src/validation.js";
 
 const app = express();
 const port = Number(process.env.PORT || 3000);
@@ -41,6 +45,65 @@ app.get("/health", (_request, response) => {
   });
 });
 
+
+// Prepare a proof-of-possession challenge bound to the caller's Fabric identity.
+app.post("/api/signing-key/challenge", async (request, response) => {
+  const errors = validateSigningKeyChallenge(request.body);
+  if (errors.length) {
+    return response.status(400).json({ error: "Invalid request", details: errors });
+  }
+  try {
+    const challenge = await getContract().evaluateTransaction(
+      "GetSigningKeyChallenge",
+      request.body.publicKeyPem,
+      request.body.signatureAlgorithm.trim().toUpperCase(),
+    );
+    return response.json({ challenge: Buffer.from(challenge).toString("utf8") });
+  } catch (error) {
+    console.error("Signing-key challenge failed:", String(error?.message || ""));
+    return response.status(502).json({ error: "Unable to create a signing-key challenge." });
+  }
+});
+
+// Register the caller's application key after its owner signs the identity-bound challenge.
+app.post("/api/signing-key", async (request, response) => {
+  const errors = validateSigningKeyRegistration(request.body);
+  if (errors.length) {
+    return response.status(400).json({ error: "Invalid request", details: errors });
+  }
+  const { publicKeyPem, signatureAlgorithm, proofSignature } = request.body;
+  try {
+    await getContract().submitTransaction(
+      "RegisterSigningKey",
+      publicKeyPem,
+      signatureAlgorithm.trim().toUpperCase(),
+      proofSignature.trim(),
+    );
+    return response.status(201).json({ message: "Signing key registered to the authenticated Fabric identity." });
+  } catch (error) {
+    const detail = String(error?.message || "");
+    if (detail.includes("already registered")) {
+      return response.status(409).json({ error: "A signing key is already registered for this Fabric identity." });
+    }
+    console.error("RegisterSigningKey transaction failed:", detail);
+    return response.status(502).json({ error: "Signing-key registration failed." });
+  }
+});
+
+app.get("/api/signing-key", async (_request, response) => {
+  try {
+    const result = await getContract().evaluateTransaction("GetSigningKey");
+    return response.json(decodeResult(result));
+  } catch (error) {
+    const detail = String(error?.message || "");
+    if (detail.includes("no signing key is registered")) {
+      return response.status(404).json({ error: "No signing key is registered for this Fabric identity." });
+    }
+    console.error("GetSigningKey query failed:", detail);
+    return response.status(502).json({ error: "Unable to read the registered signing key." });
+  }
+});
+
 // Accepts only digest/signature metadata. Message plaintext is never sent to the ledger.
 app.post("/api/messages", async (request, response) => {
   const errors = validateRecordMessage(request.body);
@@ -48,7 +111,7 @@ app.post("/api/messages", async (request, response) => {
     return response.status(400).json({ error: "Invalid request", details: errors });
   }
 
-  const { messageId, receiver, messageHash, signature, signatureAlgorithm } = request.body;
+  const { messageId, receiver, messageHash, signature } = request.body;
   try {
     await getContract().submitTransaction(
       "RecordMessage",
@@ -56,7 +119,6 @@ app.post("/api/messages", async (request, response) => {
       receiver.trim(),
       messageHash.trim().toLowerCase(),
       signature.trim(),
-      signatureAlgorithm.trim().toUpperCase(),
     );
 
     return response.status(201).json({
