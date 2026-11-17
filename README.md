@@ -72,6 +72,8 @@ BlockSecure-Blockchain-Network/
     ├── package.json
     ├── server.js
     ├── README.md
+    ├── scripts/
+    │   └── send-test-message.js
     └── src/
         ├── fabric.js
         ├── validation.js
@@ -79,6 +81,20 @@ BlockSecure-Blockchain-Network/
 ```
 
 Private environment files, Fabric credentials, backups, and vendored dependencies are excluded from version control.
+
+## Deploy the updated signed-message chaincode
+
+The earlier local Fabric test-network session deployed the sample asset-transfer contract as version `1.0`, sequence `1`. The signed-message contract in this repository is a new chaincode definition. After pulling this repository, deploy it as a new version and sequence; do not try to invoke the new message transactions against the old package.
+
+From the local test-network directory, after the existing network/channel are running:
+
+```bash
+cd ~/BlockSecure/fabric-samples/test-network
+source scripts/envVar.sh
+./network.sh deployCC -ccn blocksecure -ccp ../../BlockSecure-GitHub/blocksecure-chaincode -ccl go -ccv 2.0 -ccs 2
+```
+
+This command assumes the repository clone is at `~/BlockSecure/BlockSecure-GitHub`. Adjust the chaincode path if your clone is elsewhere. Confirm the output says the new chaincode definition is committed on `mychannel` before starting the backend.
 
 ## Local development requirements
 
@@ -88,6 +104,10 @@ Private environment files, Fabric credentials, backups, and vendored dependencie
 - Node.js 20 or newer for the API
 
 The earlier local test-network work verified the Fabric network lifecycle and demonstrated message-independent asset CRUD operations. The message-ledger contract and REST API in this repository are the next implementation stage and **must be tested and redeployed locally before being described as operational**.
+
+## Continuous integration
+
+GitHub Actions runs the Go chaincode tests/build and the Node API validation tests on pushes and pull requests to `main`. See the [Actions workflow](.github/workflows/ci.yml).
 
 ## Local checks
 
