@@ -21,13 +21,16 @@ This repository contains the Go smart contract and a Node.js API starter that co
 5. The chaincode records the signed digest and metadata on `mychannel`.
 6. The API can retrieve message records and compare a submitted digest with the on-chain digest.
 
-The signing key must correspond to the Fabric X.509 identity used to submit the transaction. For per-user attribution, the backend must use a separate authenticated Fabric identity/Gateway session for each user. The included API starter uses one identity from its local `.env` configuration.
+The application signing key can differ from the Fabric enrollment key, but it must be registered with a proof-of-possession challenge under the authenticated Fabric identity. The included API starter uses one Fabric identity from its local `.env` configuration. For per-user attribution, the backend must use a separate authenticated Fabric identity/Gateway session for each user. Key rotation is not implemented yet.
 
 ## Smart contract transactions
 
 | Function | Purpose |
 |---|---|
-| `RecordMessage` | Validate a digest signature and store message metadata |
+| `GetSigningKeyChallenge` | Create a proof-of-possession challenge bound to the caller Fabric identity |
+| `RegisterSigningKey` | Verify key ownership and bind one app public key to the caller Fabric identity |
+| `GetSigningKey` | Read the signing key registered to the caller |
+| `RecordMessage` | Verify the registered key signature and store message metadata |
 | `ReadMessage` | Read a message record by ID |
 | `MessageExists` | Check whether a message ID is already recorded |
 | `VerifyMessageHash` | Compare a supplied SHA-256 digest with the ledger record |
@@ -44,6 +47,9 @@ The `backend/` directory connects to Fabric using the official [Hyperledger Fabr
 | Method | Endpoint | Purpose |
 |---|---|---|
 | GET | `/health` | API health and configured channel/chaincode |
+| POST | `/api/signing-key/challenge` | Create a key-registration challenge |
+| POST | `/api/signing-key` | Register a public key with proof of possession |
+| GET | `/api/signing-key` | Read the caller's registered key |
 | POST | `/api/messages` | Submit a signed message digest |
 | GET | `/api/messages` | List all message records |
 | GET | `/api/messages?sender=<id>` | Filter by sender |
