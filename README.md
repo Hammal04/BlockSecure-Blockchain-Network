@@ -38,7 +38,7 @@ The application signing key can differ from the Fabric enrollment key, but it mu
 | `GetMessagesBySender` | List records for a Fabric client identity |
 | `GetMessagesByReceiver` | List records for a receiver |
 
-Supported application-signature algorithms are `ECDSA-SHA256`, `RSA-PSS-SHA256`, `RSA-PKCS1V15-SHA256`, and `ED25519`. The signature input is Base64 and the message hash is a 64-character SHA-256 hexadecimal digest. The Fabric test-network identity is normally ECDSA; other algorithms require a matching supported X.509 identity key.
+Supported application-signature algorithms are `ECDSA-SHA256`, `RSA-PSS-SHA256`, `RSA-PKCS1V15-SHA256`, and `ED25519`. The signature input is Base64 and the message hash is a 64-character SHA-256 hexadecimal digest. The registered application key is bound to the authenticated Fabric identity and may use ECDSA, RSA, or Ed25519. The caller must prove possession of the application private key when registering it.
 
 ## Node.js API
 
