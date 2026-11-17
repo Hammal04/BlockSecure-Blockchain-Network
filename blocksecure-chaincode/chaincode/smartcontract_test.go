@@ -1,184 +1,179 @@
-package chaincode_test
+package chaincode
 
 import (
+	"crypto/ecdsa"
+	"crypto/ed25519"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"testing"
+	"time"
 
-	"github.com/hyperledger/fabric-chaincode-go/v2/shim"
+	"github.com/hyperledger/fabric-chaincode-go/v2/pkg/cid"
 	"github.com/hyperledger/fabric-contract-api-go/v2/contractapi"
-	"github.com/hyperledger/fabric-protos-go-apiv2/ledger/queryresult"
-	"github.com/hyperledger/fabric-samples/asset-transfer-basic/chaincode-go/chaincode"
 	"github.com/hyperledger/fabric-samples/asset-transfer-basic/chaincode-go/chaincode/mocks"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
-//go:generate counterfeiter -o mocks/transaction.go -fake-name TransactionContext . transactionContext
-type transactionContext interface { //nolint:unused
-	contractapi.TransactionContextInterface
+type testClientIdentity struct {
+	id  string
+	msp string
+	certPublicKey any
+	certRaw []byte
 }
 
-//go:generate counterfeiter -o mocks/chaincodestub.go -fake-name ChaincodeStub . chaincodeStub
-type chaincodeStub interface { //nolint:unused
-	shim.ChaincodeStubInterface
+func (i testClientIdentity) GetID() (string, error) { return i.id, nil }
+func (i testClientIdentity) GetMSPID() (string, error) { return i.msp, nil }
+func (i testClientIdentity) GetAttributeValue(string) (string, bool, error) { return "", false, nil }
+func (i testClientIdentity) AssertAttributeValue(string, string) error { return nil }
+func (i testClientIdentity) GetX509Certificate() (*x509.Certificate, error) {
+	return &x509.Certificate{PublicKey: i.certPublicKey, Raw: i.certRaw}, nil
 }
 
-//go:generate counterfeiter -o mocks/statequeryiterator.go -fake-name StateQueryIterator . stateQueryIterator
-type stateQueryIterator interface { //nolint:unused
-	shim.StateQueryIteratorInterface
+var _ cid.ClientIdentity = testClientIdentity{}
+
+func TestParseSHA256Hash(t *testing.T) {
+	digest := sha256.Sum256([]byte("BlockSecure test"))
+	parsed, normalized, err := parseSHA256Hash(hex.EncodeToString(digest[:]))
+	require.NoError(t, err)
+	require.Equal(t, digest[:], parsed)
+	require.Equal(t, hex.EncodeToString(digest[:]), normalized)
+
+	_, _, err = parseSHA256Hash("not-a-hash")
+	require.Error(t, err)
 }
 
-func TestInitLedger(t *testing.T) {
-	chaincodeStub := &mocks.ChaincodeStub{}
-	transactionContext := &mocks.TransactionContext{}
-	transactionContext.GetStubReturns(chaincodeStub)
-
-	assetTransfer := chaincode.SmartContract{}
-	err := assetTransfer.InitLedger(transactionContext)
+func TestVerifyPublicKeySignatureECDSA(t *testing.T) {
+	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+	digest := sha256.Sum256([]byte("signed message"))
+	signature, err := ecdsa.SignASN1(rand.Reader, privateKey, digest[:])
 	require.NoError(t, err)
 
-	chaincodeStub.PutStateReturns(errors.New("failed inserting key"))
-	err = assetTransfer.InitLedger(transactionContext)
-	require.EqualError(t, err, "failed to put to world state. failed inserting key")
+	require.NoError(t, verifyPublicKeySignature(&privateKey.PublicKey, digest[:], signature, "ECDSA-SHA256"))
+	require.Error(t, verifyPublicKeySignature(&privateKey.PublicKey, []byte("wrong digest"), signature, "ECDSA-SHA256"))
+	require.Error(t, verifyPublicKeySignature(&privateKey.PublicKey, digest[:], signature, "UNKNOWN"))
 }
 
-func TestCreateAsset(t *testing.T) {
-	chaincodeStub := &mocks.ChaincodeStub{}
-	transactionContext := &mocks.TransactionContext{}
-	transactionContext.GetStubReturns(chaincodeStub)
-
-	assetTransfer := chaincode.SmartContract{}
-	err := assetTransfer.CreateAsset(transactionContext, "", "", 0, "", 0)
+func TestVerifyPublicKeySignatureEd25519(t *testing.T) {
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
 	require.NoError(t, err)
-
-	chaincodeStub.GetStateReturns([]byte{}, nil)
-	err = assetTransfer.CreateAsset(transactionContext, "asset1", "", 0, "", 0)
-	require.EqualError(t, err, "the asset asset1 already exists")
-
-	chaincodeStub.GetStateReturns(nil, errors.New("unable to retrieve asset"))
-	err = assetTransfer.CreateAsset(transactionContext, "asset1", "", 0, "", 0)
-	require.EqualError(t, err, "failed to read from world state: unable to retrieve asset")
+	digest := sha256.Sum256([]byte("signed message"))
+	signature := ed25519.Sign(privateKey, digest[:])
+	require.NoError(t, verifyPublicKeySignature(publicKey, digest[:], signature, "ED25519"))
+	require.Error(t, verifyPublicKeySignature(publicKey, []byte("wrong"), signature, "ED25519"))
 }
 
-func TestReadAsset(t *testing.T) {
-	chaincodeStub := &mocks.ChaincodeStub{}
-	transactionContext := &mocks.TransactionContext{}
-	transactionContext.GetStubReturns(chaincodeStub)
-
-	expectedAsset := &chaincode.Asset{ID: "asset1"}
-	bytes, err := json.Marshal(expectedAsset)
+func TestRecordMessageUsesAuthenticatedIdentityAndStoresMetadata(t *testing.T) {
+	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	require.NoError(t, err)
 
-	chaincodeStub.GetStateReturns(bytes, nil)
-	assetTransfer := chaincode.SmartContract{}
-	asset, err := assetTransfer.ReadAsset(transactionContext, "")
+	message := []byte("This is an example message. Plaintext stays off-chain.")
+	digest := sha256.Sum256(message)
+	signature, err := ecdsa.SignASN1(rand.Reader, privateKey, digest[:])
 	require.NoError(t, err)
-	require.Equal(t, expectedAsset, asset)
 
-	chaincodeStub.GetStateReturns(nil, errors.New("unable to retrieve asset"))
-	_, err = assetTransfer.ReadAsset(transactionContext, "")
-	require.EqualError(t, err, "failed to read from world state: unable to retrieve asset")
+	stub := &mocks.ChaincodeStub{}
+	stub.GetStateReturns(nil, nil)
+	stub.GetTxTimestampReturns(timestamppb.New(time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)), nil)
+	stub.GetTxIDReturns("tx-test-001")
 
-	chaincodeStub.GetStateReturns(nil, nil)
-	asset, err = assetTransfer.ReadAsset(transactionContext, "asset1")
-	require.EqualError(t, err, "the asset asset1 does not exist")
-	require.Nil(t, asset)
+	context := &mocks.TransactionContext{}
+	context.GetStubReturns(stub)
+	context.GetClientIdentityReturns(testClientIdentity{
+		id: "x509::/OU=client/CN=hammal",
+		msp: "Org1MSP",
+		certPublicKey: &privateKey.PublicKey,
+		certRaw: []byte("test certificate bytes"),
+	})
+
+	contract := &SmartContract{}
+	err = contract.RecordMessage(
+		context,
+		"msg-001",
+		"receiver-01",
+		hex.EncodeToString(digest[:]),
+		base64.StdEncoding.EncodeToString(signature),
+		"ECDSA-SHA256",
+	)
+	require.NoError(t, err)
+	require.Equal(t, 1, stub.PutStateCallCount())
+
+	key, stored := stub.PutStateArgsForCall(0)
+	require.Equal(t, "message:msg-001", key)
+	var record MessageRecord
+	require.NoError(t, json.Unmarshal(stored, &record))
+	require.Equal(t, "x509::/OU=client/CN=hammal", record.Sender)
+	require.Equal(t, "Org1MSP", record.SenderMSPID)
+	require.Equal(t, "receiver-01", record.Receiver)
+	require.Equal(t, hex.EncodeToString(digest[:]), record.MessageHash)
+	require.Equal(t, "tx-test-001", record.TransactionID)
+	require.NotContains(t, string(stored), string(message))
 }
 
-func TestUpdateAsset(t *testing.T) {
-	chaincodeStub := &mocks.ChaincodeStub{}
-	transactionContext := &mocks.TransactionContext{}
-	transactionContext.GetStubReturns(chaincodeStub)
-
-	expectedAsset := &chaincode.Asset{ID: "asset1"}
-	bytes, err := json.Marshal(expectedAsset)
+func TestRecordMessageRejectsBadSignatureAndDuplicate(t *testing.T) {
+	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	require.NoError(t, err)
-
-	chaincodeStub.GetStateReturns(bytes, nil)
-	assetTransfer := chaincode.SmartContract{}
-	err = assetTransfer.UpdateAsset(transactionContext, "", "", 0, "", 0)
+	digest := sha256.Sum256([]byte("payload"))
+	validSignature, err := ecdsa.SignASN1(rand.Reader, privateKey, digest[:])
 	require.NoError(t, err)
+	validArgs := []string{"msg-002", "receiver", hex.EncodeToString(digest[:]), base64.StdEncoding.EncodeToString(validSignature), "ECDSA-SHA256"}
 
-	chaincodeStub.GetStateReturns(nil, nil)
-	err = assetTransfer.UpdateAsset(transactionContext, "asset1", "", 0, "", 0)
-	require.EqualError(t, err, "the asset asset1 does not exist")
+	newContext := func(existing []byte) (*mocks.TransactionContext, *mocks.ChaincodeStub) {
+		stub := &mocks.ChaincodeStub{}
+		stub.GetStateReturns(existing, nil)
+		context := &mocks.TransactionContext{}
+		context.GetStubReturns(stub)
+		context.GetClientIdentityReturns(testClientIdentity{
+			id: "x509::/CN=sender", msp: "Org1MSP",
+			certPublicKey: &privateKey.PublicKey, certRaw: []byte("cert"),
+		})
+		return context, stub
+	}
 
-	chaincodeStub.GetStateReturns(nil, errors.New("unable to retrieve asset"))
-	err = assetTransfer.UpdateAsset(transactionContext, "asset1", "", 0, "", 0)
-	require.EqualError(t, err, "failed to read from world state: unable to retrieve asset")
+	contract := &SmartContract{}
+	ctx, stub := newContext(nil)
+	badSignature := []byte("bad-signature")
+	err = contract.RecordMessage(ctx, validArgs[0], validArgs[1], validArgs[2], base64.StdEncoding.EncodeToString(badSignature), validArgs[4])
+	require.Error(t, err)
+	require.Equal(t, 0, stub.PutStateCallCount())
+
+	ctx, stub = newContext([]byte("already exists"))
+	err = contract.RecordMessage(ctx, validArgs[0], validArgs[1], validArgs[2], validArgs[3], validArgs[4])
+	require.EqualError(t, err, "message msg-002 already exists")
+	require.Equal(t, 0, stub.PutStateCallCount())
 }
 
-func TestDeleteAsset(t *testing.T) {
-	chaincodeStub := &mocks.ChaincodeStub{}
-	transactionContext := &mocks.TransactionContext{}
-	transactionContext.GetStubReturns(chaincodeStub)
-
-	asset := &chaincode.Asset{ID: "asset1"}
-	bytes, err := json.Marshal(asset)
+func TestRecordMessageRejectsInvalidHashAndTimestampError(t *testing.T) {
+	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	require.NoError(t, err)
+	ctx := &mocks.TransactionContext{}
+	stub := &mocks.ChaincodeStub{}
+	ctx.GetStubReturns(stub)
+	ctx.GetClientIdentityReturns(testClientIdentity{id: "sender", msp: "Org1MSP", certPublicKey: &privateKey.PublicKey, certRaw: []byte("cert")})
 
-	chaincodeStub.GetStateReturns(bytes, nil)
-	chaincodeStub.DelStateReturns(nil)
-	assetTransfer := chaincode.SmartContract{}
-	err = assetTransfer.DeleteAsset(transactionContext, "")
+	contract := &SmartContract{}
+	err = contract.RecordMessage(ctx, "msg-003", "receiver", "bad-hash", "c2ln", "ECDSA-SHA256")
+	require.Error(t, err)
+
+	digest := sha256.Sum256([]byte("payload"))
+	signature, err := ecdsa.SignASN1(rand.Reader, privateKey, digest[:])
 	require.NoError(t, err)
-
-	chaincodeStub.GetStateReturns(nil, nil)
-	err = assetTransfer.DeleteAsset(transactionContext, "asset1")
-	require.EqualError(t, err, "the asset asset1 does not exist")
-
-	chaincodeStub.GetStateReturns(nil, errors.New("unable to retrieve asset"))
-	err = assetTransfer.DeleteAsset(transactionContext, "")
-	require.EqualError(t, err, "failed to read from world state: unable to retrieve asset")
+	stub.GetStateReturns(nil, nil)
+	stub.GetTxTimestampReturns(nil, errors.New("timestamp unavailable"))
+	err = contract.RecordMessage(ctx, "msg-003", "receiver", hex.EncodeToString(digest[:]), base64.StdEncoding.EncodeToString(signature), "ECDSA-SHA256")
+	require.ErrorContains(t, err, "failed to get transaction timestamp")
 }
 
-func TestTransferAsset(t *testing.T) {
-	chaincodeStub := &mocks.ChaincodeStub{}
-	transactionContext := &mocks.TransactionContext{}
-	transactionContext.GetStubReturns(chaincodeStub)
-
-	asset := &chaincode.Asset{ID: "asset1"}
-	bytes, err := json.Marshal(asset)
-	require.NoError(t, err)
-
-	chaincodeStub.GetStateReturns(bytes, nil)
-	assetTransfer := chaincode.SmartContract{}
-	_, err = assetTransfer.TransferAsset(transactionContext, "", "")
-	require.NoError(t, err)
-
-	chaincodeStub.GetStateReturns(nil, errors.New("unable to retrieve asset"))
-	_, err = assetTransfer.TransferAsset(transactionContext, "", "")
-	require.EqualError(t, err, "failed to read from world state: unable to retrieve asset")
+func TestMessageIDValidation(t *testing.T) {
+	require.False(t, messageIDPattern.MatchString("../bad/key"))
+	require.True(t, messageIDPattern.MatchString("message_001-v1"))
 }
 
-func TestGetAllAssets(t *testing.T) {
-	asset := &chaincode.Asset{ID: "asset1"}
-	bytes, err := json.Marshal(asset)
-	require.NoError(t, err)
-
-	iterator := &mocks.StateQueryIterator{}
-	iterator.HasNextReturnsOnCall(0, true)
-	iterator.HasNextReturnsOnCall(1, false)
-	iterator.NextReturns(&queryresult.KV{Value: bytes}, nil)
-
-	chaincodeStub := &mocks.ChaincodeStub{}
-	transactionContext := &mocks.TransactionContext{}
-	transactionContext.GetStubReturns(chaincodeStub)
-
-	chaincodeStub.GetStateByRangeReturns(iterator, nil)
-	assetTransfer := &chaincode.SmartContract{}
-	assets, err := assetTransfer.GetAllAssets(transactionContext)
-	require.NoError(t, err)
-	require.Equal(t, []*chaincode.Asset{asset}, assets)
-
-	iterator.HasNextReturns(true)
-	iterator.NextReturns(nil, errors.New("failed retrieving next item"))
-	assets, err = assetTransfer.GetAllAssets(transactionContext)
-	require.EqualError(t, err, "failed retrieving next item")
-	require.Nil(t, assets)
-
-	chaincodeStub.GetStateByRangeReturns(nil, errors.New("failed retrieving all assets"))
-	assets, err = assetTransfer.GetAllAssets(transactionContext)
-	require.EqualError(t, err, "failed retrieving all assets")
-	require.Nil(t, assets)
-}
+var _ contractapi.TransactionContextInterface = (*mocks.TransactionContext)(nil)
