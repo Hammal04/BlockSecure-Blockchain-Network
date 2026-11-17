@@ -84,6 +84,28 @@ The chaincode derives the sender from the authenticated Fabric X.509 identity an
 
 This starter service uses the single Fabric identity configured in `.env` for all submitted transactions. Therefore records are attributed to that configured Fabric identity. For per-user sender attribution, the authentication layer must map each logged-in application user to their own Fabric enrollment identity and create/use a Gateway connection for that identity. Do not expose an Admin private key to the browser or commit it to source control.
 
+## End-to-end smoke test
+
+After the API is running and `.env` points to the same Org1 identity certificate/private key used by the Gateway, open a second terminal in this directory and run:
+
+```bash
+node scripts/send-test-message.js demo-001 "Org2MSP::recipient" "This plaintext is hashed locally and not sent to the API"
+```
+
+The helper hashes and signs the supplied message locally, then sends only the digest and signature metadata to `POST /api/messages`. It is intended for a local integration smoke test with the default ECDSA Fabric test-network identity. Use a new `messageId` each time because message records are immutable and duplicate IDs are rejected.
+
+You can then inspect the ledger record:
+
+```bash
+curl http://127.0.0.1:3000/api/messages/demo-001
+```
+
+And verify a supplied digest:
+
+```bash
+curl "http://127.0.0.1:3000/api/messages/demo-001/verify?hash=<64-character-sha256-hex>"
+```
+
 ## Tests
 
 ```bash
