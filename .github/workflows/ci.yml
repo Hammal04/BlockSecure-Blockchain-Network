@@ -1,0 +1,43 @@
+name: BlockSecure checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  chaincode:
+    name: Go chaincode tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.x"
+          cache-dependency-path: blocksecure-chaincode/go.sum
+      - name: Test chaincode
+        working-directory: blocksecure-chaincode
+        run: go test ./...
+      - name: Build chaincode
+        working-directory: blocksecure-chaincode
+        run: go build ./...
+
+  backend:
+    name: Node API tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install dependencies
+        working-directory: backend
+        run: npm install
+      - name: Test API validation
+        working-directory: backend
+        run: npm test
