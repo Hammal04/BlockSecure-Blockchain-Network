@@ -2,55 +2,56 @@
 
 **Course:** EE-347 Computer Networks  
 **Group:** 13  
-**Blockchain platform:** Hyperledger Fabric  
-**Chaincode language:** Go  
-**Network tooling:** Docker and Docker Compose
+**Blockchain:** Hyperledger Fabric  
+**Chaincode:** Go  
+**Backend:** Node.js REST API using Fabric Gateway
 
 ## Project overview
 
-BlockSecure is a permissioned-blockchain course project. This repository currently contains the blockchain chaincode work developed and tested on a local Hyperledger Fabric test network.
+BlockSecure is a permissioned-blockchain project for recording and validating secure-message integrity metadata. The blockchain stores message hashes, the authenticated sender identity, receiver metadata, a digital signature, and transaction metadata. **Message plaintext and private keys remain off-chain.**
 
-> **Scope note:** The current chaincode is the Hyperledger Fabric Asset Transfer sample copied into a separate project folder and deployed under the chaincode name `blocksecure`. It demonstrates Fabric network setup, chaincode lifecycle, ledger reads and writes, and asset operations. It is not yet the project-specific secure-message/hash/signature contract, and backend/API integration is still pending.
+This repository contains the Go smart contract and a Node.js API starter that connects to the Fabric Gateway.
 
-## Current implementation
+## Architecture
 
-The chaincode currently exposes these functions:
+1. The client/cryptography component creates a SHA-256 digest of a message and signs that digest.
+2. The Node.js API receives only the digest and signature metadata; it does not accept or persist plaintext message content.
+3. The API submits the transaction through the Hyperledger Fabric Gateway.
+4. The Go chaincode derives the sender from the authenticated Fabric X.509 identity and verifies the signature using that identity certificate's public key.
+5. The chaincode records the signed digest and metadata on `mychannel`.
+6. The API can retrieve message records and compare a submitted digest with the on-chain digest.
+
+The signing key must correspond to the Fabric X.509 identity used to submit the transaction. For per-user attribution, the backend must use a separate authenticated Fabric identity/Gateway session for each user. The included API starter uses one identity from its local `.env` configuration.
+
+## Smart contract transactions
 
 | Function | Purpose |
 |---|---|
-| `InitLedger` | Creates the sample ledger records |
-| `CreateAsset` | Creates an asset |
-| `ReadAsset` | Reads an asset by ID |
-| `UpdateAsset` | Updates an existing asset |
-| `DeleteAsset` | Deletes an asset |
-| `AssetExists` | Checks whether an asset exists |
-| `TransferAsset` | Changes an asset's owner |
-| `GetAllAssets` | Returns all assets |
+| `RecordMessage` | Validate a digest signature and store message metadata |
+| `ReadMessage` | Read a message record by ID |
+| `MessageExists` | Check whether a message ID is already recorded |
+| `VerifyMessageHash` | Compare a supplied SHA-256 digest with the ledger record |
+| `GetAllMessages` | Return all recorded messages |
+| `GetMessagesBySender` | List records for a Fabric client identity |
+| `GetMessagesByReceiver` | List records for a receiver |
 
-## Development environment
+Supported application-signature algorithms are `ECDSA-SHA256`, `RSA-PSS-SHA256`, `RSA-PKCS1V15-SHA256`, and `ED25519`. The signature input is Base64 and the message hash is a 64-character SHA-256 hexadecimal digest. The Fabric test-network identity is normally ECDSA; other algorithms require a matching supported X.509 identity key.
 
-- Hyperledger Fabric test network
-- Two peer organizations: Org1 and Org2
-- Channel: `mychannel`
-- Chaincode name: `blocksecure`
-- Chaincode version: `1.0`
-- Go toolchain: `1.25.0`
-- Fabric Contract API Go dependency: `v2.2.0`
+## Node.js API
 
-## Verified work
+The `backend/` directory connects to Fabric using the official [Hyperledger Fabric Gateway Node API](https://hyperledger.github.io/fabric-gateway/main/api/node/).
 
-The following operations were run against the local Fabric test network:
+| Method | Endpoint | Purpose |
+|---|---|---|
+| GET | `/health` | API health and configured channel/chaincode |
+| POST | `/api/messages` | Submit a signed message digest |
+| GET | `/api/messages` | List all message records |
+| GET | `/api/messages?sender=<id>` | Filter by sender |
+| GET | `/api/messages?receiver=<id>` | Filter by receiver |
+| GET | `/api/messages/:messageId` | Read a message record |
+| GET | `/api/messages/:messageId/verify?hash=<sha256>` | Verify a digest against the ledger |
 
-- Chaincode packaged and installed on Org1 and Org2 peers.
-- Chaincode definition approved by both organizations and committed to `mychannel`.
-- Ledger initialization completed successfully.
-- Asset create and read operations succeeded.
-- Asset ownership transfer was invoked and the new owner was verified.
-- Asset update was invoked and the updated record was verified.
-- Asset deletion was invoked; a subsequent read correctly reported that the temporary asset did not exist.
-- Go tests and `go build ./...` completed successfully for the copied chaincode module.
-
-These results document local test-network validation; they do not yet demonstrate production deployment or the final secure-communication workflow.
+See [backend/README.md](backend/README.md) for installation, environment configuration, API request format, and local startup instructions.
 
 ## Repository structure
 
@@ -58,41 +59,59 @@ These results document local test-network validation; they do not yet demonstrat
 BlockSecure-Blockchain-Network/
 ├── .gitignore
 ├── README.md
-└── blocksecure-chaincode/
-    ├── assetTransfer.go
-    ├── go.mod
-    ├── go.sum
-    └── chaincode/
-        ├── smartcontract.go
-        ├── smartcontract_test.go
-        └── mocks/
-            ├── chaincodestub.go
-            ├── statequeryiterator.go
-            └── transaction.go
+├── blocksecure-chaincode/
+│   ├── assetTransfer.go
+│   ├── go.mod
+│   ├── go.sum
+│   └── chaincode/
+│       ├── smartcontract.go
+│       ├── smartcontract_test.go
+│       └── mocks/
+└── backend/
+    ├── .env.example
+    ├── package.json
+    ├── server.js
+    ├── README.md
+    └── src/
+        ├── fabric.js
+        ├── validation.js
+        └── validation.test.js
 ```
 
-Local recovery backups and vendored dependencies are excluded from the repository.
+Private environment files, Fabric credentials, backups, and vendored dependencies are excluded from version control.
 
-## Planned work
+## Local development requirements
 
-1. Design and implement BlockSecure-specific message metadata and integrity-recording functions.
-2. Store message hashes and required metadata on the ledger; keep message contents and private keys off-chain.
-3. Define and implement the message-signature verification flow in coordination with the cryptography workstream.
-4. Integrate the Fabric Gateway/client with the Node.js backend.
-5. Connect backend endpoints to the frontend and validate end-to-end behavior with the team.
-6. Add integration tests, screenshots, and project documentation.
+- Hyperledger Fabric v2.4 or later with the peer Gateway service enabled
+- Docker and Docker Compose
+- Go 1.25 or newer for the chaincode
+- Node.js 20 or newer for the API
+
+The earlier local test-network work verified the Fabric network lifecycle and demonstrated message-independent asset CRUD operations. The message-ledger contract and REST API in this repository are the next implementation stage and **must be tested and redeployed locally before being described as operational**.
+
+## Local checks
+
+Run Go tests/build from `blocksecure-chaincode/`:
+
+```bash
+go test ./...
+go build ./...
+```
+
+Run the API validation tests from `backend/`:
+
+```bash
+npm install
+npm test
+```
 
 ## Security notes
 
-- Do not commit private keys, wallet identities, MSP credentials, TLS private keys, certificates, passwords, or `.env` files.
-- Do not store plaintext private messages or private keys on the blockchain.
-- The local Fabric test-network identities and credentials are for development only.
+- Never commit private keys, wallet identities, MSP private material, TLS private keys, passwords, or real `.env` files.
+- Do not send plaintext messages or private keys to the chaincode or store them on the ledger.
+- Chaincode validates the application signature against the authenticated submitter's Fabric X.509 certificate. The submitting identity and message-signing key must therefore match.
+- The backend starter is intended for local development. Add user authentication, per-user Fabric identity handling, authorization, HTTPS, and secrets management before exposing it to a shared or production environment.
 
 ## Developer
 
 Hammal Baloch
-
-## Status
-
-**Current milestone:** Local Fabric test network setup, chaincode lifecycle deployment, and sample asset CRUD/ownership tests completed.  
-**Remaining:** Project-specific secure communication chaincode and backend/frontend integration.
