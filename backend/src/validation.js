@@ -27,6 +27,45 @@ export function isValidBase64(value) {
     && Buffer.from(normalized, "base64").length > 0;
 }
 
+export function isValidPublicKeyPEM(value) {
+  return typeof value === "string"
+    && value.length <= 16384
+    && /-----BEGIN PUBLIC KEY-----[\\s\\S]+-----END PUBLIC KEY-----/.test(value.trim());
+}
+
+export function validateSigningKeyRegistration(body) {
+  const errors = [];
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return ["Request body must be a JSON object."];
+  }
+  if (!isValidPublicKeyPEM(body.publicKeyPem)) {
+    errors.push("publicKeyPem must be a PEM-encoded SubjectPublicKeyInfo public key.");
+  }
+  if (typeof body.signatureAlgorithm !== "string"
+      || !SIGNATURE_ALGORITHMS.has(body.signatureAlgorithm.trim().toUpperCase())) {
+    errors.push("signatureAlgorithm is not supported.");
+  }
+  if (!isValidBase64(body.proofSignature)) {
+    errors.push("proofSignature must be valid Base64 data.");
+  }
+  return errors;
+}
+
+export function validateSigningKeyChallenge(body) {
+  const errors = [];
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return ["Request body must be a JSON object."];
+  }
+  if (!isValidPublicKeyPEM(body.publicKeyPem)) {
+    errors.push("publicKeyPem must be a PEM-encoded SubjectPublicKeyInfo public key.");
+  }
+  if (typeof body.signatureAlgorithm !== "string"
+      || !SIGNATURE_ALGORITHMS.has(body.signatureAlgorithm.trim().toUpperCase())) {
+    errors.push("signatureAlgorithm is not supported.");
+  }
+  return errors;
+}
+
 export function validateRecordMessage(body) {
   const errors = [];
 
@@ -46,10 +85,5 @@ export function validateRecordMessage(body) {
   if (!isValidBase64(body.signature)) {
     errors.push("signature must be valid Base64 data.");
   }
-  if (typeof body.signatureAlgorithm !== "string"
-      || !SIGNATURE_ALGORITHMS.has(body.signatureAlgorithm.trim().toUpperCase())) {
-    errors.push("signatureAlgorithm is not supported.");
-  }
-
   return errors;
 }
